@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+import httpx
 from pathlib import Path
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
@@ -28,8 +29,15 @@ BASE_OPTS = {
     'no_warnings': True,
 }
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "Referer": "https://www.tiktok.com/",
+}
+
 
 def _probe_content_type(url: str) -> str:
+    if "/photo/" in url:
+        return 'photo'
     opts = {**BASE_OPTS, 'skip_download': True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -38,6 +46,54 @@ def _probe_content_type(url: str) -> str:
     if info.get('ext') in ('jpg', 'jpeg', 'png', 'webp'):
         return 'photo'
     return 'video'
+
+
+def _extract_photo_urls(url: str) -> list[str]:
+    opts = {**BASE_OPTS, 'skip_download': True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    images = info.get('images') or []
+    if images:
+        # Берём самое высокое качество каждого фото
+        urls = []
+        for img in images:
+            if isinstance(img, list):
+                best = max(img, key=lambda x: x.get('width', 0))
+                urls.append(best['url'])
+            elif isinstance(img, dict):
+                urls.append(img['url'])
+        return urls
+
+    # Фолбэк: thumbnail
+    thumb = info.get('thumbnail')
+    if thumb:
+        return [thumb]
+
+    return []
+
+
+async def _download_photo_files(photo_urls: list[str]) -> list[Path]:
+    file_id = uuid.uuid4().hex
+    paths = []
+
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
+        for i, url in enumerate(photo_urls):
+            resp = await client.get(url)
+            resp.raise_for_status()
+
+            ext = 'jpg'
+            ct = resp.headers.get('content-type', '')
+            if 'png' in ct:
+                ext = 'png'
+            elif 'webp' in ct:
+                ext = 'webp'
+
+            path = DOWNLOAD_DIR / f"{file_id}_{i}.{ext}"
+            path.write_bytes(resp.content)
+            paths.append(path)
+
+    return paths
 
 
 def _download_video(url: str) -> Path:
@@ -56,24 +112,6 @@ def _download_video(url: str) -> Path:
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
     return out_path
-
-
-def _download_photos(url: str) -> list[Path]:
-    file_id = uuid.uuid4().hex
-    out_template = str(DOWNLOAD_DIR / f"{file_id}_%(autonumber)s.%(ext)s")
-    opts = {
-        **BASE_OPTS,
-        'outtmpl': out_template,
-        'format': 'bestvideo/best',
-        'fragment_retries': 3,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-
-    photos = []
-    for ext in ('jpg', 'jpeg', 'png', 'webp'):
-        photos.extend(sorted(DOWNLOAD_DIR.glob(f"{file_id}_*.{ext}")))
-    return photos
 
 
 @dp.message(CommandStart())
@@ -100,11 +138,13 @@ async def download_tiktok(message: types.Message):
 
         if content_type == 'photo':
             await msg.edit_text("Скачиваю фото...")
-            files = await asyncio.to_thread(_download_photos, url)
 
-            if not files:
+            photo_urls = await asyncio.to_thread(_extract_photo_urls, url)
+            if not photo_urls:
                 await msg.edit_text("Не смог найти фото в этом посте.")
                 return
+
+            files = await _download_photo_files(photo_urls)
 
             if len(files) == 1:
                 await message.answer_photo(photo=types.FSInputFile(files[0]))
