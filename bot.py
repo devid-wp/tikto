@@ -1,6 +1,7 @@
 import asyncio
 import uuid
 import re
+import json
 import httpx
 from pathlib import Path
 from aiogram import Bot, Dispatcher, types
@@ -15,7 +16,8 @@ dp = Dispatcher()
 DOWNLOAD_DIR = Path("downloads")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.tiktok.com/",
 }
 
@@ -37,8 +39,7 @@ BASE_OPTS = {
 
 
 async def _resolve_short_url(url: str) -> str:
-    """Разворачивает vt.tiktok.com в полный URL."""
-    async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10, headers=HEADERS) as client:
         resp = await client.head(url)
         return str(resp.url)
 
@@ -48,19 +49,40 @@ def _extract_video_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-async def _fetch_tiktok_api(video_id: str) -> dict:
-    """Запрос к TikTok API для получения данных поста."""
-    api_url = f"https://api22-normal-c-alisg.tiktokv.com/aweme/v1/feed/?aweme_id={video_id}&version_code=262036&app_name=musical_ly"
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=15) as client:
-        resp = await client.get(api_url)
-        resp.raise_for_status()
-        return resp.json()
+async def _scrape_photo_urls(url: str) -> list[str]:
+    """Парсим HTML страницы TikTok и вытаскиваем фото из __UNIVERSAL_DATA_FOR_REHYDRATION__."""
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
+        resp = await client.get(url)
+        html = resp.text
+
+    # TikTok прячет данные в JSON внутри тега <script>
+    match = re.search(r'<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if not match:
+        return []
+
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+
+    # Ищем imagePost внутри вложенного JSON
+    raw = json.dumps(data)
+    images_match = re.findall(r'"imageURL"\s*:\s*\{[^}]*"urlList"\s*:\s*\[([^\]]+)\]', raw)
+
+    urls = []
+    for block in images_match:
+        found = re.findall(r'"(https://[^"]+)"', block)
+        if found:
+            # Берём первый URL (лучшее качество)
+            urls.append(found[0])
+
+    return urls
 
 
 async def _download_photo_files(photo_urls: list[str]) -> list[Path]:
     file_id = uuid.uuid4().hex
     paths = []
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30) as client:
         for i, url in enumerate(photo_urls):
             resp = await client.get(url)
             resp.raise_for_status()
@@ -110,32 +132,19 @@ async def download_tiktok(message: types.Message):
     files: list[Path] = []
 
     try:
-        # Разворачиваем короткие ссылки (vt.tiktok.com)
         if "vt.tiktok.com" in url or "vm.tiktok.com" in url:
             url = await _resolve_short_url(url)
 
-        video_id = _extract_video_id(url)
         is_photo = "/photo/" in url
 
-        if is_photo and video_id:
+        if is_photo:
             await msg.edit_text("Скачиваю фото...")
 
-            data = await _fetch_tiktok_api(video_id)
-            aweme = data.get("aweme_list", [{}])[0]
+            photo_urls = await _scrape_photo_urls(url)
 
-            # TikTok возвращает фото в image_post_info
-            image_info = aweme.get("image_post_info", {})
-            images = image_info.get("images", [])
-
-            if not images:
-                await msg.edit_text("Не смог найти фото в этом посте.")
+            if not photo_urls:
+                await msg.edit_text("Не смог найти фото — попробуй отправить полную ссылку из браузера.")
                 return
-
-            photo_urls = [
-                img["display_image"]["url_list"][0]
-                for img in images
-                if img.get("display_image", {}).get("url_list")
-            ]
 
             files = await _download_photo_files(photo_urls)
 
@@ -147,7 +156,6 @@ async def download_tiktok(message: types.Message):
                     for f in files
                 ]
                 await message.answer_media_group(media=media_group)
-
         else:
             await msg.edit_text("Скачиваю видео...")
             video_path = await asyncio.to_thread(_download_video, url)
