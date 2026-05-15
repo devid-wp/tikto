@@ -81,16 +81,77 @@ async def download_tiktok(message: types.Message):
             url = await _resolve_short_url(url)
 
         # 2. Определяем тип контента
-        if "/photo/" in url:
-            await msg.edit_text("📸 Обнаружены фото, скачиваю...")
-            # Используем yt-dlp для фото тоже (он умеет вытягивать ссылки)
-            with yt_dlp.YoutubeDL(get_yt_dlp_opts("")) as ydl:
-                info = ydl.extract_info(url, download=False)
-                photo_urls = [e['url'] for e in info.get('entries', []) if 'url' in e]
-                if not photo_urls and 'url' in info: photo_urls = [info['url']]
+      @dp.message()
+async def download_tiktok(message: types.Message):
+    url = message.text.strip() if message.text else ""
 
+    if "tiktok.com" not in url:
+        return
+
+    msg = await message.answer("🔍 Обрабатываю ссылку...")
+    files: list[Path] = []
+
+    try:
+        # 1. Разворачиваем короткую ссылку
+        if any(domain in url for domain in ["vt.tiktok.com", "vm.tiktok.com"]):
+            url = await _resolve_short_url(url)
+
+        # 2. Извлекаем инфо через yt-dlp (универсальный способ)
+        with yt_dlp.YoutubeDL(get_yt_dlp_opts("")) as ydl:
+            # Используем to_thread, чтобы не блокировать поток
+            info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+            
+        # ПРОВЕРКА: Это фото/слайд-шоу или видео?
+        # В TikTok слайд-шоу часто имеют тип 'playlist' или содержат список entries
+        if info.get('entries') or "/photo/" in url or info.get('api_reveal') == 'post_photo':
+            await msg.edit_text("📸 Обнаружены фото, скачиваю слайды...")
+            
+            # Собираем прямые ссылки на изображения
+            photo_urls = []
+            if 'entries' in info:
+                photo_urls = [e['url'] for e in info['entries'] if e.get('url')]
+            elif 'url' in info:
+                photo_urls = [info['url']]
+            
             if not photo_urls:
-                raise Exception("Не удалось найти фото")
+                raise Exception("Не удалось извлечь ссылки на фото.")
+
+            # Скачивание фото
+            file_id = uuid.uuid4().hex
+            async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
+                for i, p_url in enumerate(photo_urls[:10]):  # Лимит 10 фото (ограничение Telegram)
+                    res = await client.get(p_url)
+                    if res.status_code == 200:
+                        p_path = DOWNLOAD_DIR / f"{file_id}_{i}.jpg"
+                        p_path.write_bytes(res.content)
+                        files.append(p_path)
+
+            if not files:
+                raise Exception("Не удалось скачать ни одного изображения.")
+
+            # Отправка группой
+            media_group = [types.InputMediaPhoto(media=types.FSInputFile(f)) for f in files]
+            await message.answer_media_group(media=media_group)
+            
+        else:
+            # Это видео
+            await msg.edit_text("⏳ Скачиваю видео, подожди...")
+            video_path = await asyncio.to_thread(_download_video, url)
+            files.append(video_path)
+            await message.answer_video(video=types.FSInputFile(video_path))
+
+        await msg.delete()
+
+    except Exception as e:
+        logging.error(f"Ошибка: {e}")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+    finally:
+        # Очистка
+        for f in files:
+            try:
+                if f.exists(): f.unlink()
+            except Exception: pass
 
             # Скачивание фото
             file_id = uuid.uuid4().hex
