@@ -67,34 +67,62 @@ async def download_tiktok(message: types.Message):
     msg = await message.answer("🔍 Обрабатываю ссылку...")
     files: list[Path] = []
 
-    try:
+   try:
         # 1. Разворачиваем короткую ссылку
         if any(x in url for x in ["vt.tiktok.com", "vm.tiktok.com"]):
             url = await _resolve_short_url(url)
+        
+        # Очищаем URL от мусора (?_r=1...)
+        url = url.split('?')[0]
 
-        # 2. Получаем информацию без скачивания (в отдельном потоке)
-        with yt_dlp.YoutubeDL(get_yt_dlp_opts("")) as ydl:
+        # 2. Получаем информацию
+        # Добавляем ignoreerrors, чтобы yt-dlp не падал сразу
+        ydl_opts = get_yt_dlp_opts("")
+        ydl_opts['ignoreerrors'] = True 
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await asyncio.to_thread(ydl.extract_info, url, download=False)
 
-        # 3. Проверка на фото/слайд-шоу
-        # Проверяем URL, флаги API или наличие списка записей (entries)
-        is_photo = "/photo/" in url or info.get('api_reveal') == 'post_photo' or 'entries' in info
+        if not info:
+            raise Exception("TikTok не отдал данные. Попробуйте обновить yt-dlp (pip install -U yt-dlp)")
 
-        if is_photo:
+        # 3. Проверка на фото (слайд-шоу)
+        # В новых версиях TikTok фото могут лежать в 'entries' или 'formats'
+        photo_urls = []
+        if 'entries' in info:
+            photo_urls = [e['url'] for e in info['entries'] if e.get('url')]
+        
+        # Если yt-dlp не нашел entries, но это точно фото-пост
+        if not photo_urls and "/photo/" in url:
+            # Пытаемся вытащить из превью или форматов, если yt-dlp отдал хоть что-то
+            if 'formats' in info:
+                photo_urls = [f['url'] for f in info['formats'] if f.get('protocol') == 'https' or 'image' in f.get('format_note', '').lower()]
+
+        if photo_urls:
             await msg.edit_text("📸 Обнаружено фото, скачиваю...")
-            
-            photo_urls = []
-            if 'entries' in info:
-                photo_urls = [e['url'] for e in info['entries'] if e.get('url')]
-            elif 'formats' in info:
-                photo_urls = [f['url'] for f in info['formats'] if 'image' in f.get('format_note', '').lower()]
-            
-            if not photo_urls and info.get('url'):
-                photo_urls = [info['url']]
+            file_id = uuid.uuid4().hex
+            async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
+                for i, p_url in enumerate(photo_urls[:10]):
+                    res = await client.get(p_url)
+                    if res.status_code == 200:
+                        p_path = DOWNLOAD_DIR / f"{file_id}_{i}.jpg"
+                        p_path.write_bytes(res.content)
+                        files.append(p_path)
 
-            if not photo_urls:
-                raise Exception("Не удалось найти прямые ссылки на фото.")
+            if files:
+                media_group = [types.InputMediaPhoto(media=types.FSInputFile(f)) for f in files]
+                await message.answer_media_group(media=media_group)
+                await msg.delete()
+                return # Выходим, если успешно отправили фото
+            else:
+                raise Exception("Не удалось скачать изображения")
 
+        # 4. Если не фото, значит видео
+        await msg.edit_text("⏳ Скачиваю видео...")
+        video_path = await asyncio.to_thread(_download_video, url)
+        files.append(video_path)
+        await message.answer_video(video=types.FSInputFile(video_path))
+        await msg.delete()
             # Скачиваем фото (ограничение 10 штук для Telegram)
             file_id = uuid.uuid4().hex
             async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
