@@ -1,10 +1,8 @@
 import asyncio
 import uuid
-import re
-import json
-import httpx
 import logging
 import os
+import httpx
 from pathlib import Path
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
@@ -12,17 +10,16 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 import yt_dlp
 
-# Настройка логирования (чтобы видеть ошибки в консоли Termux)
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
 TOKEN = "8252398181:AAGjvUgZAXqakp_0vC5IQnVBifungWIFXFc"
 DOWNLOAD_DIR = Path("downloads")
-COOKIES_FILE = "cookies.txt"  # Файл с куками должен быть в папке с ботом
+COOKIES_FILE = "cookies.txt"
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# Улучшенные заголовки
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -37,24 +34,20 @@ def get_yt_dlp_opts(out_path: str):
         'merge_output_format': 'mp4',
         'socket_timeout': 15,
         'retries': 5,
-        # Настройки для обхода блокировок:
         'extractor_args': {'tiktok': {'webpage_download': True}},
     }
-    # Если файл с куками существует, используем его
     if os.path.exists(COOKIES_FILE):
         opts['cookiefile'] = COOKIES_FILE
-        logging.info("Использую cookies.txt для авторизации")
     return opts
 
 async def _resolve_short_url(url: str) -> str:
     async with httpx.AsyncClient(follow_redirects=True, timeout=15, headers=HEADERS) as client:
-        resp = await client.get(url) # Head иногда не срабатывает в TikTok
+        resp = await client.get(url)
         return str(resp.url)
 
 def _download_video(url: str) -> Path:
     file_id = uuid.uuid4().hex
     out_path = DOWNLOAD_DIR / f"{file_id}.mp4"
-    
     with yt_dlp.YoutubeDL(get_yt_dlp_opts(str(out_path))) as ydl:
         ydl.download([url])
     return out_path
@@ -68,7 +61,6 @@ async def start(message: types.Message):
 @dp.message()
 async def download_tiktok(message: types.Message):
     url = message.text.strip() if message.text else ""
-
     if "tiktok.com" not in url:
         return
 
@@ -77,49 +69,36 @@ async def download_tiktok(message: types.Message):
 
     try:
         # 1. Разворачиваем короткую ссылку
-        if "vt.tiktok.com" in url or "vm.tiktok.com" in url:
+        if any(x in url for x in ["vt.tiktok.com", "vm.tiktok.com"]):
             url = await _resolve_short_url(url)
 
-        # 2. Определяем тип контента
-      @dp.message()
-async def download_tiktok(message: types.Message):
-    url = message.text.strip() if message.text else ""
-
-    if "tiktok.com" not in url:
-        return
-
-    msg = await message.answer("🔍 Обрабатываю ссылку...")
-    files: list[Path] = []
-
-    try:
-        # 1. Разворачиваем короткую ссылку
-        if any(domain in url for domain in ["vt.tiktok.com", "vm.tiktok.com"]):
-            url = await _resolve_short_url(url)
-
-        # 2. Извлекаем инфо через yt-dlp (универсальный способ)
+        # 2. Получаем информацию без скачивания (в отдельном потоке)
         with yt_dlp.YoutubeDL(get_yt_dlp_opts("")) as ydl:
-            # Используем to_thread, чтобы не блокировать поток
             info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+
+        # 3. Проверка на фото/слайд-шоу
+        # Проверяем URL, флаги API или наличие списка записей (entries)
+        is_photo = "/photo/" in url or info.get('api_reveal') == 'post_photo' or 'entries' in info
+
+        if is_photo:
+            await msg.edit_text("📸 Обнаружено фото, скачиваю...")
             
-        # ПРОВЕРКА: Это фото/слайд-шоу или видео?
-        # В TikTok слайд-шоу часто имеют тип 'playlist' или содержат список entries
-        if info.get('entries') or "/photo/" in url or info.get('api_reveal') == 'post_photo':
-            await msg.edit_text("📸 Обнаружены фото, скачиваю слайды...")
-            
-            # Собираем прямые ссылки на изображения
             photo_urls = []
             if 'entries' in info:
                 photo_urls = [e['url'] for e in info['entries'] if e.get('url')]
-            elif 'url' in info:
-                photo_urls = [info['url']]
+            elif 'formats' in info:
+                photo_urls = [f['url'] for f in info['formats'] if 'image' in f.get('format_note', '').lower()]
             
-            if not photo_urls:
-                raise Exception("Не удалось извлечь ссылки на фото.")
+            if not photo_urls and info.get('url'):
+                photo_urls = [info['url']]
 
-            # Скачивание фото
+            if not photo_urls:
+                raise Exception("Не удалось найти прямые ссылки на фото.")
+
+            # Скачиваем фото (ограничение 10 штук для Telegram)
             file_id = uuid.uuid4().hex
             async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
-                for i, p_url in enumerate(photo_urls[:10]):  # Лимит 10 фото (ограничение Telegram)
+                for i, p_url in enumerate(photo_urls[:10]):
                     res = await client.get(p_url)
                     if res.status_code == 200:
                         p_path = DOWNLOAD_DIR / f"{file_id}_{i}.jpg"
@@ -127,15 +106,14 @@ async def download_tiktok(message: types.Message):
                         files.append(p_path)
 
             if not files:
-                raise Exception("Не удалось скачать ни одного изображения.")
+                raise Exception("Ошибка при загрузке файлов.")
 
-            # Отправка группой
             media_group = [types.InputMediaPhoto(media=types.FSInputFile(f)) for f in files]
             await message.answer_media_group(media=media_group)
             
         else:
-            # Это видео
-            await msg.edit_text("⏳ Скачиваю видео, подожди...")
+            # 4. Обработка видео
+            await msg.edit_text("⏳ Скачиваю видео...")
             video_path = await asyncio.to_thread(_download_video, url)
             files.append(video_path)
             await message.answer_video(video=types.FSInputFile(video_path))
@@ -144,53 +122,21 @@ async def download_tiktok(message: types.Message):
 
     except Exception as e:
         logging.error(f"Ошибка: {e}")
-        await msg.edit_text(f"❌ Ошибка: {e}")
-
-    finally:
-        # Очистка
-        for f in files:
-            try:
-                if f.exists(): f.unlink()
-            except Exception: pass
-
-            # Скачивание фото
-            file_id = uuid.uuid4().hex
-            async with httpx.AsyncClient(headers=HEADERS, timeout=30) as client:
-                for i, p_url in enumerate(photo_urls[:10]): # Лимит 10 фото для медиагруппы
-                    res = await client.get(p_url)
-                    p_path = DOWNLOAD_DIR / f"{file_id}_{i}.jpg"
-                    p_path.write_bytes(res.content)
-                    files.append(p_path)
-
-            media_group = [types.InputMediaPhoto(media=types.FSInputFile(f)) for f in files]
-            await message.answer_media_group(media=media_group)
-            
+        error_text = str(e)
+        if "cookies" in error_text.lower():
+            await msg.edit_text("⚠️ Нужно обновить cookies.txt!")
         else:
-            await msg.edit_text("⏳ Скачиваю видео, подожди...")
-            video_path = await asyncio.to_thread(_download_video, url)
-            files.append(video_path)
-            await message.answer_video(video=types.FSInputFile(video_path))
-
-        await msg.delete()
-
-    except Exception as e:
-        error_msg = str(e)
-        if "cookies" in error_msg.lower():
-            await msg.edit_text("⚠️ Это видео требует авторизации. Нужно обновить cookies.txt на сервере.")
-        else:
-            logging.error(f"Ошибка: {e}")
             await msg.edit_text(f"❌ Ошибка: {e}")
 
     finally:
-        # Очистка файлов
+        # Очистка временных файлов
         for f in files:
             try:
                 if f.exists(): f.unlink()
-            except Exception: pass
+            except: pass
 
 async def main():
     DOWNLOAD_DIR.mkdir(exist_ok=True)
-    # Удаляем вебхук перед запуском (важно для Termux)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
